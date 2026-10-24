@@ -6,10 +6,17 @@ import WebRuntime from '@deepseek-ai/dsh-web'
 import { HttpFetchProvider, LOCAL_FETCH_PROVIDER_ID } from '@deepseek-ai/dsh-web-fetch-http'
 import type { HttpFetchLimits } from '@deepseek-ai/dsh-web-fetch-http'
 import * as fetchPlugin from '@deepseek-ai/dsh-web-fetch-http'
-import { classifyContentType, decoderForCharset, isSameOrigin, parseCharset, validateFetchUrl } from '../src/policy.ts'
+import {
+  classifyContentType,
+  decoderForCharset,
+  isSameOrigin,
+  parseCharset,
+  parseFetchUrl,
+  validateFetchUrl,
+  WEB_FETCH_MAX_URL_LENGTH,
+} from '../src/policy.ts'
 
 const limits: HttpFetchLimits = {
-  maxUrlLength: 2048,
   maxResponseBytes: 5_000_000,
   maxBodyChars: 100_000,
   timeoutMs: 5_000,
@@ -33,6 +40,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
   vi.unstubAllGlobals()
+  vi.restoreAllMocks()
   await new Promise<void>(resolve => server.close(() => { resolve() }))
 })
 
@@ -42,11 +50,15 @@ function provider(overrides: Partial<HttpFetchLimits> = {}): HttpFetchProvider {
 
 describe('policy helpers', () => {
   it('validates scheme, credentials, and length', () => {
-    expect(validateFetchUrl('https://example.com/x', 2048).hostname).toBe('example.com')
-    expect(() => validateFetchUrl('ftp://example.com', 2048)).toThrow(expect.objectContaining({ code: 'WEB_INVALID_URL' }))
-    expect(() => validateFetchUrl('not a url', 2048)).toThrow(expect.objectContaining({ code: 'WEB_INVALID_URL' }))
-    expect(() => validateFetchUrl('https://user:pass@example.com', 2048)).toThrow(expect.objectContaining({ code: 'WEB_BLOCKED_URL' }))
-    expect(() => validateFetchUrl(`https://example.com/${'a'.repeat(3000)}`, 2048)).toThrow(expect.objectContaining({ code: 'WEB_INVALID_URL' }))
+    expect(parseFetchUrl('https://example.com/preflight').pathname).toBe('/preflight')
+    expect(validateFetchUrl('https://example.com/x').hostname).toBe('example.com')
+    expect(() => validateFetchUrl('ftp://example.com')).toThrow(expect.objectContaining({ code: 'WEB_INVALID_URL' }))
+    expect(() => validateFetchUrl('not a url')).toThrow(expect.objectContaining({ code: 'WEB_INVALID_URL' }))
+    expect(() => validateFetchUrl('https://user:pass@example.com')).toThrow(expect.objectContaining({ code: 'WEB_BLOCKED_URL' }))
+    const prefix = 'https://example.com/'
+    const exact = `${prefix}${'a'.repeat(WEB_FETCH_MAX_URL_LENGTH - prefix.length)}`
+    expect(validateFetchUrl(exact).href).toBe(exact)
+    expect(() => validateFetchUrl(`${exact}a`)).toThrow(expect.objectContaining({ code: 'WEB_INVALID_URL' }))
   })
 
   it('classifies content types', () => {
@@ -274,6 +286,12 @@ describe('HttpFetchProvider redirects', () => {
 })
 
 describe('HttpFetchProvider invalid URLs and abort', () => {
+  it.each(['localhost', '127.0.0.1'])('fetches a non-public destination at %s', async (host) => {
+    const { port } = server.address() as AddressInfo
+    const result = await provider().fetch({ url: `http://${host}:${port}/` })
+    expect(result.body).toEqual({ kind: 'text', content: 'default' })
+  })
+
   it('rejects a non-http scheme before any network access', async () => {
     await expect(provider().fetch({ url: 'ftp://example.com' }))
       .rejects.toThrow(expect.objectContaining({ code: 'WEB_INVALID_URL' }))
@@ -328,42 +346,36 @@ describe('HttpFetchProvider invalid URLs and abort', () => {
 })
 
 describe('HttpFetchProvider body cancellation on error paths', () => {
-  /** A fake Response whose body.cancel is observable. */
-  type FakeInit = { status: number; headers: Record<string, string>; location?: string }
-  function fakeResponse(init: FakeInit): { response: Response; cancelled: () => boolean } {
-    let cancelled = false
-    const headers = new Headers(init.headers)
-    if (init.location !== undefined) headers.set('location', init.location)
-    const response = {
-      status: init.status,
-      headers,
-      body: { cancel: () => { cancelled = true; return Promise.resolve() } },
-    } as unknown as Response
-    return { response, cancelled: () => cancelled }
+  /** Answer with headers and an unfinished body; resolves when the client closes the socket. */
+  function respondWithOpenBody(status: number, headers: Record<string, string>): Promise<void> {
+    return new Promise((resolve) => {
+      handler = (req, res) => {
+        req.socket.once('close', () => { resolve() })
+        res.writeHead(status, headers)
+        res.write('unfinished')
+      }
+    })
   }
 
   it('cancels the body when a cross-origin redirect is blocked', async () => {
-    const { response, cancelled } = fakeResponse({ status: 302, headers: {}, location: 'https://elsewhere.test/' })
-    vi.stubGlobal('fetch', vi.fn(async () => response))
-    await expect(provider().fetch({ url: 'http://127.0.0.1:9/' }))
+    const closed = respondWithOpenBody(302, { location: 'https://elsewhere.test/' })
+    await expect(provider().fetch({ url: base }))
       .rejects.toThrow(expect.objectContaining({ code: 'WEB_REDIRECT_BLOCKED' }))
-    expect(cancelled()).toBe(true)
+    await closed
   })
 
   it('cancels the body when an unsupported charset is rejected', async () => {
-    const { response, cancelled } = fakeResponse({ status: 200, headers: { 'content-type': 'text/plain; charset=not-a-charset' } })
-    vi.stubGlobal('fetch', vi.fn(async () => response))
-    await expect(provider().fetch({ url: 'http://127.0.0.1:9/' }))
+    const closed = respondWithOpenBody(200, { 'content-type': 'text/plain; charset=not-a-charset' })
+    await expect(provider().fetch({ url: base }))
       .rejects.toThrow(expect.objectContaining({ code: 'WEB_UNSUPPORTED_CONTENT_TYPE' }))
-    expect(cancelled()).toBe(true)
+    await closed
   })
 
   it('cancels the body when a redirect has no Location header', async () => {
-    const { response, cancelled } = fakeResponse({ status: 302, headers: {} })
-    vi.stubGlobal('fetch', vi.fn(async () => response))
-    await expect(provider().fetch({ url: 'http://127.0.0.1:9/' }))
+    const closed = respondWithOpenBody(302, {})
+    await expect(provider().fetch({ url: base }))
       .rejects.toThrow(expect.objectContaining({ code: 'WEB_PROVIDER_ERROR' }))
-    expect(cancelled()).toBe(true)
+    await closed
   })
 })
 

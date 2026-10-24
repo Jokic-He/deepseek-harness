@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -47,6 +47,75 @@ describe('sqlite backend specifics', () => {
     const unit = await backend.kv.open(DESCRIPTOR)
     await unit.putRecord('records', 'k', { n: 1 })
     expect((await unit.loadAll()).tables['records']).toEqual({ k: { n: 1 } })
+    await backend.close()
+  })
+
+  it('rolls back a batch delete whose transaction fails', async () => {
+    const path = await freshDbPath()
+    const backend = backendAt(path)
+    const unit = await backend.kv.open(DESCRIPTOR)
+    await unit.putRecord('records', 'a', { n: 1 })
+    await unit.putRecord('records', 'b', { n: 2 })
+    const db = new DatabaseSync(path)
+    db.exec('CREATE TRIGGER block_b BEFORE DELETE ON "u_specimen_records"'
+      + " WHEN old.key = 'b' BEGIN SELECT RAISE(ABORT, 'blocked'); END")
+    await expect(unit.deleteRecords('records', ['a', 'b'])).rejects.toThrow(/blocked/)
+    db.exec('DROP TRIGGER block_b')
+    db.close()
+    // The transaction rolled back, so the key deleted before the failing row is back.
+    expect((await unit.loadAll()).tables['records']).toEqual({ a: { n: 1 }, b: { n: 2 } })
+    await backend.close()
+  })
+
+  it('reports unknown-state when a failed batch cannot roll back', async () => {
+    const path = await freshDbPath()
+    const backend = backendAt(path)
+    const unit = await backend.kv.open(DESCRIPTOR)
+    await unit.putRecord('records', 'a', { n: 1 })
+    await unit.putRecord('records', 'b', { n: 2 })
+    const db = new DatabaseSync(path)
+    db.exec('CREATE TRIGGER block_b BEFORE DELETE ON "u_specimen_records"'
+      + " WHEN old.key = 'b' BEGIN SELECT RAISE(ABORT, 'blocked'); END")
+    // oxlint-disable-next-line typescript/unbound-method -- Delegated through Reflect.apply with the spy's receiver.
+    const original = DatabaseSync.prototype.exec
+    const execSpy = vi.spyOn(DatabaseSync.prototype, 'exec').mockImplementation(function (this: DatabaseSync, sql: string) {
+      if (sql === 'ROLLBACK') throw new Error('rollback denied')
+      Reflect.apply(original, this, [sql])
+    })
+    try {
+      await expect(unit.deleteRecords('records', ['a', 'b'])).rejects.toMatchObject({ code: 'unknown-state' })
+      // Later statements would run inside the still-open transaction.
+      await expect(unit.putRecord('records', 'c', { n: 3 })).rejects.toMatchObject({ code: 'unknown-state' })
+      await expect(unit.loadAll()).rejects.toMatchObject({ code: 'unknown-state' })
+    } finally {
+      execSpy.mockRestore()
+      db.close()
+    }
+    // The denied rollback leaves the unit's connection in a transaction; the
+    // backend close is what releases it, and this test's file is discarded by
+    // afterEach.
+    await expect(unit.close()).resolves.toBeUndefined()
+    await backend.close()
+  })
+
+  it('reports unknown-state when a batch cannot open its transaction', async () => {
+    const path = await freshDbPath()
+    const backend = backendAt(path)
+    const unit = await backend.kv.open(DESCRIPTOR)
+    await unit.putRecord('records', 'a', { n: 1 })
+    // oxlint-disable-next-line typescript/unbound-method -- Delegated through Reflect.apply with the spy's receiver.
+    const original = DatabaseSync.prototype.exec
+    const execSpy = vi.spyOn(DatabaseSync.prototype, 'exec').mockImplementation(function (this: DatabaseSync, sql: string) {
+      if (sql.startsWith('BEGIN')) throw new Error('begin denied')
+      Reflect.apply(original, this, [sql])
+    })
+    try {
+      await expect(unit.deleteRecords('records', ['a'])).rejects.toMatchObject({ code: 'unknown-state' })
+      await expect(unit.deleteRecord('records', 'a')).rejects.toMatchObject({ code: 'unknown-state' })
+    } finally {
+      execSpy.mockRestore()
+    }
+    await expect(unit.close()).resolves.toBeUndefined()
     await backend.close()
   })
 
@@ -124,31 +193,49 @@ describe('sqlite backend specifics', () => {
     await backend.close()
   })
 
+  // Repeated durable DDL across four connections needs an instrumented I/O budget.
   it('leaves a failed materialization unstamped so a repaired medium reopens', async () => {
     const path = await freshDbPath()
     // Obstruct table creation: an index squatting on the unit_globals name
     // makes CREATE TABLE IF NOT EXISTS throw AFTER the units table exists.
     const setup = new DatabaseSync(path)
-    setup.exec('CREATE TABLE squatter (x TEXT)')
-    setup.exec('CREATE INDEX unit_globals ON squatter(x)')
-    setup.close()
+    try {
+      setup.exec('CREATE TABLE squatter (x TEXT)')
+      setup.exec('CREATE INDEX unit_globals ON squatter(x)')
+    } finally {
+      setup.close()
+    }
 
     const broken = backendAt(path)
-    await expect(broken.kv.open(DESCRIPTOR)).rejects.toThrow(/already an index/)
-    await broken.close()
+    try {
+      await expect(broken.kv.open(DESCRIPTOR)).rejects.toThrow(/already an index/)
+    } finally {
+      await broken.close()
+    }
 
     // Clear the obstruction; the medium must still be version 0, not a
     // half-materialized database stamped as current.
     const repair = new DatabaseSync(path)
-    expect((repair.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(0)
-    repair.exec('DROP INDEX unit_globals')
-    repair.close()
+    try {
+      expect((repair.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(0)
+      expect(repair.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'units'").get())
+        .toEqual({ name: 'units' })
+      repair.exec('DROP INDEX unit_globals')
+      expect(repair.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'unit_globals'").get())
+        .toBeUndefined()
+    } finally {
+      repair.close()
+    }
 
     const backend = backendAt(path)
-    const unit = await backend.kv.open(DESCRIPTOR)
-    await unit.putRecord('records', 'k', { n: 1 })
-    await backend.close()
-  })
+    try {
+      const unit = await backend.kv.open(DESCRIPTOR)
+      await unit.putRecord('records', 'k', { n: 1 })
+      expect((await unit.loadAll()).tables['records']).toEqual({ k: { n: 1 } })
+    } finally {
+      await backend.close()
+    }
+  }, 90_000)
 
   it('rejects unparsable stored JSON with malformed-medium', async () => {
     const path = await freshDbPath()
